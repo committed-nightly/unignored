@@ -1,0 +1,125 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest
+
+  dogfood:
+    # Run it on this repository and on repositories built to be wrong, because
+    # a linter that has only ever been run by its own test suite is a linter
+    # nobody has run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e .
+
+      - name: our own ignore rules all still do something
+        run: unignored
+
+      # `code=0; cmd || code=$?` rather than `cmd; code=$?`, because these steps
+      # run under `bash -e` and the whole point is a command that exits non-zero.
+      - name: the mistake everyone makes is caught
+        run: |
+          git init -q /tmp/classic
+          printf 'build/\n!build/keep.txt\n' > /tmp/classic/.gitignore
+          code=0; unignored /tmp/classic || code=$?
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          unignored /tmp/classic | grep -q 'never re-includes build/keep.txt' \
+            || { unignored /tmp/classic; echo "wrong finding"; exit 1; }
+
+      - name: and the form that works stays quiet
+        # The guard on the whole tool. `build/*` excludes build's contents, not
+        # build, so the negation below it is reached and the rule is alive. An
+        # earlier version of this check asked git about `build/` with a trailing
+        # slash, which let the `*` match nothing at all and called this correct
+        # file a finding. If that ever comes back, this step goes red.
+        run: |
+          git init -q /tmp/correct
+          printf 'build/*\n!build/keep.txt\n' > /tmp/correct/.gitignore
+          code=0; unignored /tmp/correct || code=$?
+          test "$code" -eq 0 || { unignored /tmp/correct; echo "false positive"; exit 1; }
+
+      - name: a tracked file is reported against the rule that misses it
+        run: |
+          git init -q /tmp/tracked
+          cd /tmp/tracked
+          git config user.email ci@example.com && git config user.name ci
+          printf '*.log\n' > .gitignore
+          touch app.log && git add -f app.log && git commit -qm t
+          code=0; unignored . || code=$?
+          test "$code" -eq 1 || { echo "expected exit 1, got $code"; exit 1; }
+          unignored . | grep -q 'git already tracks' || { unignored .; exit 1; }
+
+      - name: a self-ignoring marker is not reported
+        # pytest leaves one of these in .pytest_cache on any repository that has
+        # run its tests, so getting this wrong means the tool fails on itself.
+        run: |
+          git init -q /tmp/marker
+          printf '.pytest_cache/\n' > /tmp/marker/.gitignore
+          mkdir -p /tmp/marker/.pytest_cache
+          printf '# Created by pytest automatically.\n*\n' > /tmp/marker/.pytest_cache/.gitignore
+          code=0; unignored /tmp/marker || code=$?
+          test "$code" -eq 0 || { unignored /tmp/marker; echo "false positive"; exit 1; }
+
+      - name: a directory that is not a repository is an error, not a pass
+        run: |
+          mkdir -p /tmp/notarepo
+          code=0; unignored /tmp/notarepo || code=$?
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
+
+      - name: real repositories do not produce nonsense
+        # Four repositories nobody here wrote, as a net for the false positive
+        # no fixture in the test suite thought to build.
+        #
+        # Only flask is asserted clean, and that assertion is about this tool:
+        # 36 rules across 3 ignore files, none of them dead, so anything we
+        # start reporting there is ours. The other three are run for the crash
+        # and for exit 2, which would mean the tool could not read a real
+        # repository -- but their findings are not pinned. They each have one
+        # genuine finding today, and if someone upstream fixes it that is their
+        # commit turning our main red for no reason.
+        run: |
+          set -u
+          mkdir -p /tmp/real
+          runs_cleanly() {
+            git clone -q --depth 1 "https://github.com/$1" "/tmp/real/$2"
+            code=0; unignored "/tmp/real/$2" > "/tmp/real/$2.txt" || code=$?
+            cat "/tmp/real/$2.txt"
+            if [ "$code" -gt 1 ]; then
+              echo "$1: exit $code -- the tool could not read a real repository"
+              exit 1
+            fi
+            return "$code"
+          }
+
+          runs_cleanly pallets/flask flask || {
+            echo "flask has no dead rules; anything reported there is ours"
+            exit 1
+          }
+
+          for repo in psf/requests rust-lang/mdbook prettier/prettier; do
+            runs_cleanly "$repo" "$(basename "$repo")" || true
+          done
