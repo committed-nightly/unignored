@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unignored.rules import Rule, collect, literal_ancestors, parse, strip_trailing_space
+from unignored.rules import Rule, collect, literal_path, parse, strip_trailing_space
 
 
 def rule(text: str) -> Rule:
@@ -53,32 +53,35 @@ class TestTrailingSpace:
         assert strip_trailing_space("  name") == "  name"
 
 
-class TestLiteralAncestors:
-    def test_one_directory(self):
-        assert literal_ancestors(rule("!build/keep.txt")) == ["build"]
+class TestLiteralPath:
+    def test_a_literal_pattern_names_its_path(self):
+        assert literal_path(rule("!build/keep.txt")) == "build/keep.txt"
 
-    def test_several(self):
-        assert literal_ancestors(rule("!a/b/c.txt")) == ["a", "a/b"]
+    def test_deeper(self):
+        assert literal_path(rule("!a/b/c.txt")) == "a/b/c.txt"
 
-    def test_leading_slash_anchors_but_is_not_a_component(self):
-        assert literal_ancestors(rule("!/src/main.c")) == ["src"]
+    def test_leading_slash_anchors_but_is_not_part_of_the_path(self):
+        assert literal_path(rule("!/src/main.c")) == "src/main.c"
 
-    def test_a_bare_name_is_pinned_under_nothing(self):
-        # `keep.txt` matches at any depth, so no one directory can be blamed.
-        assert literal_ancestors(rule("!keep.txt")) == []
+    def test_a_bare_name_names_no_one_path(self):
+        # `keep.txt` matches at any depth: dead inside an excluded directory and
+        # alive everywhere else, which is not a single answer.
+        assert literal_path(rule("!keep.txt")) is None
 
-    def test_glob_stops_the_walk(self):
-        assert literal_ancestors(rule("!build/*/keep.txt")) == ["build"]
+    def test_a_glob_names_a_set_not_a_path(self):
+        assert literal_path(rule("!build/*.keep")) is None
+        assert literal_path(rule("!**/build/keep.txt")) is None
+        assert literal_path(rule("!build/keep?.txt")) is None
+        assert literal_path(rule("!build/[abc].txt")) is None
 
-    def test_leading_globstar_yields_nothing(self):
-        assert literal_ancestors(rule("!**/build/keep.txt")) == []
+    def test_a_directory_pattern_is_declined(self):
+        # Asking git about a directory that may not exist brings back the
+        # trailing-slash trap the file probe exists to avoid.
+        assert literal_path(rule("!build/sub/")) is None
 
-    def test_trailing_slash_is_not_a_component(self):
-        assert literal_ancestors(rule("!build/sub/")) == ["build"]
-
-    def test_backslash_stops_the_walk(self):
-        # An escape could mean anything; guessing at it would invent findings.
-        assert literal_ancestors(rule("!a\\*b/c.txt")) == []
+    def test_a_backslash_is_declined(self):
+        # An escape could mean several things; guessing would invent findings.
+        assert literal_path(rule("!a\\ b/c.txt")) is None
 
 
 class TestCollect:

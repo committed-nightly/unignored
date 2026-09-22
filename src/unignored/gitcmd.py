@@ -12,12 +12,19 @@ Two flags matter and both were arrived at the hard way:
 `--no-index` -- without it, check-ignore stays silent about any path in the
 index, which is exactly the set of paths the tracked check is about.
 
-Directories must be passed with a trailing slash. A pattern ending in `/` only
-matches a directory, and for a path that is not on disk git decides what it is
-from the string it was given:
+Directories are passed *without* a trailing slash, and that is the flag's one
+real trap. A trailing slash makes git treat the string as a directory, which is
+the only way a `build/` rule will match a path that is not on disk -- but it
+also lets the `*` in a `build/*` rule match the empty string after it:
 
-    $ git check-ignore -v --no-index build/    ->  .gitignore:1:build/
+    $ git check-ignore -v --no-index build/    ->  .gitignore:1:build/*
     $ git check-ignore -v --no-index build     ->  (nothing)
+
+`build/*` excludes the contents of build, not build itself, and the difference
+between those two is the entire subject of this tool. So every directory asked
+about here is one that exists on disk, where git stats it and needs no hint.
+Questions about directories that do not exist are asked a different way -- see
+`checks.unreachable_negations`, which probes the file instead.
 """
 
 from __future__ import annotations
@@ -131,12 +138,11 @@ class Git:
     def is_excluded(self, directory: str) -> Decision | None:
         """The rule excluding this directory, if it is excluded.
 
-        `directory` is repo-relative and need not exist. A negation that wins is
-        not an exclusion, so it comes back as None.
+        `directory` is repo-relative and must exist on disk. A negation that
+        wins is not an exclusion, so it comes back as None.
         """
-        answer = self.check_ignore([directory.rstrip("/") + "/"]).get(
-            directory.rstrip("/") + "/"
-        )
+        path = directory.rstrip("/")
+        answer = self.check_ignore([path]).get(path)
         if answer is None or answer.negated:
             return None
         return answer

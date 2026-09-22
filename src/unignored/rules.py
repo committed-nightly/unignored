@@ -122,35 +122,33 @@ def read_ignore_file(root: str, relpath: str) -> IgnoreFile | None:
     return IgnoreFile(path=relpath, directory=directory, rules=rules)
 
 
-def literal_ancestors(rule: Rule) -> list[str]:
-    """The directories a rule's own pattern pins it under, if any.
+def literal_path(rule: Rule) -> str | None:
+    """The one path this rule names, if it names exactly one.
 
-    `build/keep.txt` is pinned under `build`. `a/b/c.txt` is pinned under `a`
-    and `a/b`. `*.keep`, `**/keep.txt` and a bare `keep.txt` are pinned under
-    nothing -- they match at any depth, so no single directory can be blamed
-    for them.
+    `!build/keep.txt` names `build/keep.txt` and nothing else, so git can be
+    asked about that path directly and its answer is the whole story. Returns
+    None where no single path will do:
 
-    Anything with a glob or a backslash in a component stops the walk there:
-    the aim is a list of directories that certainly exist in the path, not a
-    guess at what a glob might expand to.
+    * `!*.keep`, `!build/*.keep` -- a glob stands for a set, not a path.
+    * `!keep.txt` -- no slash, so it matches at any depth. It is dead inside an
+      excluded directory and alive everywhere else, which is not one answer.
+    * `!build/keep/` -- names a directory, and asking git about a directory
+      that may not exist reintroduces the trailing-slash trap in gitcmd.
+    * anything with a backslash -- an escape could mean several things and
+      guessing would invent findings.
+
+    The returned path is relative to the ignore file's own directory; the caller
+    joins it.
     """
     body = rule.body
-    if body.endswith("/"):
-        body = body[:-1]
-    parts = body.split("/")
-    if parts and parts[0] == "":
-        parts = parts[1:]  # a leading slash anchors, it is not a component
-    if len(parts) < 2:
-        return []  # no directory component at all
-
-    ancestors: list[str] = []
-    prefix = ""
-    for part in parts[:-1]:
-        if part == "" or "\\" in part or any(char in part for char in MAGIC):
-            break
-        prefix = f"{prefix}/{part}" if prefix else part
-        ancestors.append(prefix)
-    return ancestors
+    if body.endswith("/") or "\\" in body:
+        return None
+    if any(char in body for char in MAGIC):
+        return None
+    path = body[1:] if body.startswith("/") else body
+    if "/" not in path or path == "":
+        return None
+    return path
 
 
 def _is_submodule(path: str) -> bool:
@@ -177,10 +175,13 @@ def collect(root: str, git: Git) -> list[IgnoreFile]:
 
     level = _subdirectories(root, "")
     while level:
-        verdicts = git.check_ignore([f"{d}/" for d in level])
+        # No trailing slash: these all exist on disk, so git can see for itself
+        # that they are directories, and a `build/*` rule will not falsely match
+        # `build/` by letting its `*` stand for nothing. See gitcmd.
+        verdicts = git.check_ignore(level)
         next_level: list[str] = []
         for directory in level:
-            decision = verdicts.get(f"{directory}/")
+            decision = verdicts.get(directory)
             excluded = decision if decision is not None and not decision.negated else None
 
             found = read_ignore_file(root, os.path.join(directory, IGNORE_FILE))

@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass, field
 
 from .gitcmd import Decision, Git
-from .rules import IgnoreFile, Rule, literal_ancestors
+from .rules import IgnoreFile, Rule, literal_path
 
 TRACKED = "tracked"
 UNREACHABLE_NEGATION = "unreachable-negation"
@@ -104,51 +104,46 @@ def tracked(git: Git, max_paths: int = SAMPLE) -> list[Finding]:
 
 
 def unreachable_negations(git: Git, files: list[IgnoreFile]) -> list[Finding]:
-    """`!` rules that can never put anything back.
+    """`!` rules that never put back the file they name.
 
     gitignore(5) puts it plainly: "It is not possible to re-include a file if a
     parent directory of that file is excluded". Git does not descend into an
-    excluded directory, so it never gets far enough to read the negation. The
-    rule is not overridden -- it is not reached.
+    excluded directory, so it never gets as far as the negation inside it. The
+    rule is not overridden. It is not reached.
 
-    Only negations that name a directory in their own pattern can be judged this
-    way. `!keep.txt` matches at any depth and is dead only in the places that are
-    excluded, which is not the same claim.
+    Nothing here works that out for itself. A negation that names exactly one
+    path gets that path handed to check-ignore, and git says which rule decides
+    it -- git applies its own descend rule while answering, which is why this is
+    asked as a question about a file and not about a directory. If the answer is
+    any rule other than this one, this one does nothing for the only path it
+    names.
     """
-    candidates: list[tuple[Rule, list[str]]] = []
-    wanted: set[str] = set()
+    candidates: list[tuple[Rule, str]] = []
     for ignore_file in files:
         if not ignore_file.read:
             continue  # the whole file is already a finding of its own
         for rule in ignore_file.rules:
             if not rule.negated:
                 continue
-            ancestors = [
-                os.path.join(ignore_file.directory, a) if ignore_file.directory else a
-                for a in literal_ancestors(rule)
-            ]
-            if ancestors:
-                candidates.append((rule, ancestors))
-                wanted.update(ancestors)
+            named = literal_path(rule)
+            if named is None:
+                continue
+            if ignore_file.directory:
+                named = f"{ignore_file.directory}/{named}"
+            candidates.append((rule, named))
 
-    if not wanted:
+    if not candidates:
         return []
 
-    ordered = sorted(wanted)
-    verdicts = git.check_ignore([f"{d}/" for d in ordered])
+    verdicts = git.check_ignore(sorted({path for _, path in candidates}))
 
     findings = []
-    for rule, ancestors in candidates:
-        blocker = None
-        blocked_at = None
-        # Outermost first: that is the one git stops at, so it is the one to fix.
-        for ancestor in ancestors:
-            decision = verdicts.get(f"{ancestor}/")
-            if decision is not None and not decision.negated:
-                blocker, blocked_at = decision, ancestor
-                break
-        if blocker is None:
-            continue
+    for rule, named in candidates:
+        decision = verdicts.get(named)
+        if decision is not None and decision.key == rule.key:
+            continue  # this rule decides its own path: it is working
+        if decision is None:
+            continue  # nothing ignores the path, so nothing needed re-including
         findings.append(
             Finding(
                 check=UNREACHABLE_NEGATION,
@@ -156,13 +151,15 @@ def unreachable_negations(git: Git, files: list[IgnoreFile]) -> list[Finding]:
                 line=rule.line,
                 text=rule.text,
                 summary=(
-                    f"can never re-include anything: {blocked_at}/ is excluded by "
-                    f"{blocker.source}:{blocker.line}: {blocker.pattern}"
+                    f"never re-includes {named}: "
+                    f"{decision.source}:{decision.line}: {decision.pattern} decides it instead"
                 ),
                 fix=(
-                    f"git does not descend into an excluded directory. Exclude the "
-                    f"contents instead of the directory -- `{blocked_at}/*` in place of "
-                    f"`{blocker.pattern}` -- and the negation below it starts working"
+                    "git takes the last pattern that matches, and it does not descend "
+                    "into an excluded directory at all -- so a negation below one is "
+                    "never reached. Re-including a file means un-excluding every "
+                    "directory on the way down to it first: `build/*` rather than "
+                    "`build/`, then this line"
                 ),
             )
         )
