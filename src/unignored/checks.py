@@ -1,0 +1,248 @@
+"""The four things that make an ignore rule do nothing.
+
+Every one of them is decided, not guessed. A rule that simply matches no file in
+the working tree is not in here and never will be -- that is a rule for a build
+directory you have not built yet, and reporting it would make the other four
+findings worth less.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+
+from .gitcmd import Decision, Git
+from .rules import IgnoreFile, Rule, literal_ancestors
+
+TRACKED = "tracked"
+UNREACHABLE_NEGATION = "unreachable-negation"
+UNREAD_FILE = "unread-file"
+SHADOWED = "shadowed"
+
+
+@dataclass
+class Finding:
+    check: str
+    source: str
+    line: int | None  # None when the finding is about a whole file
+    text: str
+    summary: str
+    paths: list[str] = field(default_factory=list)
+    extra: int = 0  # paths not listed
+    fix: str = ""
+
+    @property
+    def where(self) -> str:
+        return self.source if self.line is None else f"{self.source}:{self.line}"
+
+    @property
+    def sort_key(self) -> tuple[str, int]:
+        return (self.source, -1 if self.line is None else self.line)
+
+    def as_dict(self) -> dict:
+        out = {
+            "check": self.check,
+            "source": self.source,
+            "line": self.line,
+            "text": self.text,
+            "summary": self.summary,
+            "fix": self.fix,
+        }
+        if self.paths:
+            out["paths"] = self.paths
+            out["more_paths"] = self.extra
+        return out
+
+
+SAMPLE = 5
+
+
+def tracked(git: Git, max_paths: int = SAMPLE) -> list[Finding]:
+    """Rules that match a file git already tracks.
+
+    Tracking wins. Once a path is in the index, no ignore rule touches it: it
+    keeps showing up in `git status`, its changes keep getting committed, and
+    the rule that was supposed to stop that does nothing at all for it.
+
+    This is the one finding that is about a pair rather than a rule -- the same
+    rule may be doing useful work on other, untracked paths. So the report names
+    the files, not just the line.
+    """
+    paths = git.tracked_files()
+    verdicts = git.check_ignore(paths)
+
+    hits: dict[tuple[str, int], tuple[Decision, list[str]]] = {}
+    for path in paths:
+        decision = verdicts.get(path)
+        if decision is None or decision.negated:
+            continue
+        hits.setdefault(decision.key, (decision, []))[1].append(path)
+
+    findings = []
+    for decision, matched in hits.values():
+        shown = sorted(matched)[:max_paths]
+        count = len(matched)
+        findings.append(
+            Finding(
+                check=TRACKED,
+                source=decision.source,
+                line=decision.line,
+                text=decision.pattern,
+                summary=(
+                    f"does nothing for {count} file{'s' if count != 1 else ''} "
+                    "git already tracks"
+                ),
+                paths=shown,
+                extra=count - len(shown),
+                fix=(
+                    f"an ignore rule has no effect on a tracked path. "
+                    f"`git rm --cached -- {shown[0]}` to stop tracking it, or drop the rule"
+                ),
+            )
+        )
+    return findings
+
+
+def unreachable_negations(git: Git, files: list[IgnoreFile]) -> list[Finding]:
+    """`!` rules that can never put anything back.
+
+    gitignore(5) puts it plainly: "It is not possible to re-include a file if a
+    parent directory of that file is excluded". Git does not descend into an
+    excluded directory, so it never gets far enough to read the negation. The
+    rule is not overridden -- it is not reached.
+
+    Only negations that name a directory in their own pattern can be judged this
+    way. `!keep.txt` matches at any depth and is dead only in the places that are
+    excluded, which is not the same claim.
+    """
+    candidates: list[tuple[Rule, list[str]]] = []
+    wanted: set[str] = set()
+    for ignore_file in files:
+        if not ignore_file.read:
+            continue  # the whole file is already a finding of its own
+        for rule in ignore_file.rules:
+            if not rule.negated:
+                continue
+            ancestors = [
+                os.path.join(ignore_file.directory, a) if ignore_file.directory else a
+                for a in literal_ancestors(rule)
+            ]
+            if ancestors:
+                candidates.append((rule, ancestors))
+                wanted.update(ancestors)
+
+    if not wanted:
+        return []
+
+    ordered = sorted(wanted)
+    verdicts = git.check_ignore([f"{d}/" for d in ordered])
+
+    findings = []
+    for rule, ancestors in candidates:
+        blocker = None
+        blocked_at = None
+        # Outermost first: that is the one git stops at, so it is the one to fix.
+        for ancestor in ancestors:
+            decision = verdicts.get(f"{ancestor}/")
+            if decision is not None and not decision.negated:
+                blocker, blocked_at = decision, ancestor
+                break
+        if blocker is None:
+            continue
+        findings.append(
+            Finding(
+                check=UNREACHABLE_NEGATION,
+                source=rule.source,
+                line=rule.line,
+                text=rule.text,
+                summary=(
+                    f"can never re-include anything: {blocked_at}/ is excluded by "
+                    f"{blocker.source}:{blocker.line}: {blocker.pattern}"
+                ),
+                fix=(
+                    f"git does not descend into an excluded directory. Exclude the "
+                    f"contents instead of the directory -- `{blocked_at}/*` in place of "
+                    f"`{blocker.pattern}` -- and the negation below it starts working"
+                ),
+            )
+        )
+    return findings
+
+
+def unread_files(files: list[IgnoreFile]) -> list[Finding]:
+    """Ignore files inside an excluded directory.
+
+    Nothing in them can matter. Every path below an excluded directory is already
+    ignored by the rule that excluded it, and a negation cannot reach down there
+    either, so no line in the file can change any outcome.
+    """
+    findings = []
+    for ignore_file in files:
+        if ignore_file.read:
+            continue
+        blocker = ignore_file.unread_because
+        count = len(ignore_file.rules)
+        findings.append(
+            Finding(
+                check=UNREAD_FILE,
+                source=ignore_file.path,
+                line=None,
+                text=f"{count} rule{'s' if count != 1 else ''}",
+                summary=(
+                    f"is never read: {ignore_file.directory}/ is excluded by "
+                    f"{blocker.source}:{blocker.line}: {blocker.pattern}"
+                ),
+                fix=(
+                    f"everything under {ignore_file.directory}/ is ignored whatever this "
+                    f"file says. Move the rules up to an ignore file git reads, or stop "
+                    f"excluding {ignore_file.directory}/"
+                ),
+            )
+        )
+    return findings
+
+
+def shadowed(files: list[IgnoreFile]) -> list[Finding]:
+    """Rules a later line in the same file always beats.
+
+    The last pattern to match a path decides it. So if a later line in the same
+    file has the same pattern body, the earlier one can never be the last match
+    for anything -- whether the later line agrees with it or negates it. Same
+    body only: nothing here tries to work out whether one glob covers another.
+    """
+    findings = []
+    for ignore_file in files:
+        if not ignore_file.read:
+            continue
+        last: dict[str, Rule] = {}
+        for rule in ignore_file.rules:
+            last[rule.body] = rule
+        for rule in ignore_file.rules:
+            winner = last[rule.body]
+            if winner.line == rule.line:
+                continue
+            verb = "repeats" if winner.text == rule.text else "is reversed by"
+            findings.append(
+                Finding(
+                    check=SHADOWED,
+                    source=rule.source,
+                    line=rule.line,
+                    text=rule.text,
+                    summary=(
+                        f"never decides anything: line {winner.line} "
+                        f"{verb} it, and the last match wins"
+                    ),
+                    fix=f"delete this line; `{winner.text}` on line {winner.line} is the one in effect",
+                )
+            )
+    return findings
+
+
+def scan(git: Git, files: list[IgnoreFile]) -> list[Finding]:
+    findings = (
+        tracked(git)
+        + unreachable_negations(git, files)
+        + unread_files(files)
+        + shadowed(files)
+    )
+    return sorted(findings, key=lambda f: f.sort_key)
