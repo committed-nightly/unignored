@@ -16,7 +16,6 @@ from unignored.checks import (
     shadowed,
     tracked,
     unread_files,
-    unreachable_negations,
 )
 from unignored.rules import collect
 
