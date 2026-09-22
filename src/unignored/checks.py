@@ -166,6 +166,22 @@ def unreachable_negations(git: Git, files: list[IgnoreFile]) -> list[Finding]:
     return findings
 
 
+def is_self_ignoring(ignore_file: IgnoreFile) -> bool:
+    """A `.gitignore` whose whole content is `*`.
+
+    pytest writes one of these into `.pytest_cache/`, cargo writes one into
+    `target/`, and several other tools do the same. The file exists so that the
+    directory ignores itself whether or not anything outside mentions it. When
+    the outer ignore file does mention it, this one is indeed never read -- and
+    saying so is telling someone to delete a fallback that costs nothing and
+    works the moment the outer rule is removed.
+
+    Found by running this tool on its own repository after the tests had left a
+    .pytest_cache behind.
+    """
+    return [rule.text for rule in ignore_file.rules] == ["*"]
+
+
 def unread_files(files: list[IgnoreFile]) -> list[Finding]:
     """Ignore files inside an excluded directory.
 
@@ -175,7 +191,7 @@ def unread_files(files: list[IgnoreFile]) -> list[Finding]:
     """
     findings = []
     for ignore_file in files:
-        if ignore_file.read:
+        if ignore_file.read or is_self_ignoring(ignore_file):
             continue
         blocker = ignore_file.unread_because
         count = len(ignore_file.rules)

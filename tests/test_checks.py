@@ -167,6 +167,28 @@ class TestUnreadFile:
         repo.write("src/.gitignore", "*.o\n")
         assert unread_files(collect(repo.path, repo.handle)) == []
 
+    def test_a_self_ignoring_marker_is_left_alone(self, repo):
+        # What pytest writes into .pytest_cache and cargo into target: a whole
+        # file of `*`, so the directory ignores itself with or without help.
+        # Never read here, and telling anyone to delete it would be bad advice.
+        repo.write(".gitignore", ".pytest_cache/\n")
+        repo.write(".pytest_cache/.gitignore", "# Created by pytest automatically.\n*\n")
+        assert unread_files(collect(repo.path, repo.handle)) == []
+
+    def test_a_marker_with_anything_else_in_it_is_still_reported(self, repo):
+        # `*` plus a negation is not a self-ignoring marker, it is someone
+        # expecting the negation to work. It does not.
+        repo.write(".gitignore", "vendor/\n")
+        repo.write("vendor/.gitignore", "*\n!keep.txt\n")
+        (found,) = unread_files(collect(repo.path, repo.handle))
+        assert found.source == "vendor/.gitignore"
+
+    def test_a_readable_marker_is_not_special_cased_into_silence(self, repo):
+        # Nothing to report either way -- the point is that the carve-out is
+        # about unread files only and does not reach any other check.
+        repo.write("build/.gitignore", "*\n")
+        assert unread_files(collect(repo.path, repo.handle)) == []
+
     def test_tracked_content_does_not_rescue_the_file(self, repo):
         # Git may well walk into vendor/ for the tracked file. It still does not
         # matter: tracked paths ignore ignore rules, and untracked ones are
